@@ -1,0 +1,66 @@
+name: PAQ8PX capacity probe on Kodak BGR
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 330
+    strategy:
+      fail-fast: false
+      matrix:
+        flag: ["1", "5", "8", "8A", "8L", "8LA"]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: hxim/paq8px
+          ref: v216
+          path: source
+      - name: Linux compatibility patch
+        run: ln -s Clz.hpp source/src/clz.hpp
+      - name: Build pinned codec
+        run: |
+          cmake -S source -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DNATIVECPU=OFF -DNDEBUG=ON
+          cmake --build build --parallel 2
+      - name: Prepare Kodak BGR carrier
+        run: |
+          python3 -m pip install --quiet pillow numpy
+          curl --fail --location --retry 4 -o kodim01.png https://r0k.us/graphics/kodak/kodak/kodim01.png
+          python3 - <<'PY'
+          import hashlib
+          import numpy as np
+          from PIL import Image
+          rgb=np.asarray(Image.open('kodim01.png').convert('RGB'),dtype=np.uint8)
+          Image.fromarray(rgb[:,:,[2,1,0]],mode='RGB').save('kodim01-bgr.ppm','PPM')
+          open('rgb.sha256','w').write(hashlib.sha256(rgb.tobytes()).hexdigest())
+          PY
+      - name: Encode, decode, and validate
+        env:
+          FLAG: ${{ matrix.flag }}
+        run: |
+          /usr/bin/time -f '%e,%M' -o encode.time ./build/paq8px "-${FLAG}" kodim01-bgr.ppm "kodim01-${FLAG}.paq8px216" > encode.log 2>&1
+          /usr/bin/time -f '%e,%M' -o decode.time ./build/paq8px -d "kodim01-${FLAG}.paq8px216" decoded.ppm > decode.log 2>&1
+          python3 - <<'PY'
+          import hashlib,json,os
+          import numpy as np
+          from PIL import Image
+          flag=os.environ['FLAG']
+          rgb=np.asarray(Image.open('kodim01.png').convert('RGB'),dtype=np.uint8)
+          carrier=np.asarray(Image.open('decoded.ppm').convert('RGB'),dtype=np.uint8)
+          restored=carrier[:,:,[2,1,0]]
+          if not np.array_equal(rgb,restored): raise SystemExit('RGB mismatch')
+          enc_s,enc_rss=open('encode.time').read().strip().split(',')
+          dec_s,dec_rss=open('decode.time').read().strip().split(',')
+          arc=f'kodim01-{flag}.paq8px216'; size=os.path.getsize(arc)
+          row={'image':'kodim01','representation':'BGR','flag':'-'+flag,'archive_bytes':size,'bpsp':size*8/(768*512*3),'encode_seconds':float(enc_s),'decode_seconds':float(dec_s),'encode_maxrss_kb':int(enc_rss),'decode_maxrss_kb':int(dec_rss),'exact':1,'archive_sha256':hashlib.sha256(open(arc,'rb').read()).hexdigest()}
+          os.mkdir('result'); open('result/result.json','w').write(json.dumps(row,indent=2)); os.rename(arc,'result/'+arc)
+          print(json.dumps(row,indent=2))
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: paq8px-capacity-${{ matrix.flag }}
+          path: result
+          if-no-files-found: error
+          retention-days: 3
