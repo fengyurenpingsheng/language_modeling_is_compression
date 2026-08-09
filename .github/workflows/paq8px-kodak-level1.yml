@@ -1,0 +1,122 @@
+name: PAQ8PX v216 Kodak level-1 exact benchmark
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  compress:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 330
+    strategy:
+      fail-fast: false
+      max-parallel: 24
+      matrix:
+        image: ["01","02","03","04","05","06","07","08","09","10","11","12","13","14","15","16","17","18","19","20","21","22","23","24"]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: hxim/paq8px
+          ref: v216
+          path: source
+      - name: Linux compatibility patch
+        run: ln -s Clz.hpp source/src/clz.hpp
+      - name: Build pinned codec
+        run: |
+          cmake -S source -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --parallel 2
+      - name: Prepare Kodak P6 carrier
+        env:
+          IMAGE: ${{ matrix.image }}
+        run: |
+          python3 -m pip install --quiet pillow
+          curl --fail --location --retry 4 -o "kodim${IMAGE}.png" "https://r0k.us/graphics/kodak/kodak/kodim${IMAGE}.png"
+          python3 - <<'PY'
+          import hashlib, json, os
+          from PIL import Image
+          n=os.environ['IMAGE']
+          with Image.open(f'kodim{n}.png') as src:
+              im=src.convert('RGB')
+              im.save(f'kodim{n}.ppm','PPM')
+          meta={'image':f'kodim{n}.png','width':im.width,'height':im.height,
+                'rgb_sha256':hashlib.sha256(im.tobytes()).hexdigest(),
+                'ppm_sha256':hashlib.sha256(open(f'kodim{n}.ppm','rb').read()).hexdigest()}
+          open('source.json','w').write(json.dumps(meta,indent=2))
+          PY
+      - name: Compress and decode exactly
+        env:
+          IMAGE: ${{ matrix.image }}
+        run: |
+          /usr/bin/time -f '%e,%M' -o encode.time ./build/paq8px -1 "kodim${IMAGE}.ppm" "kodim${IMAGE}.paq8px216" > encode.log 2>&1
+          /usr/bin/time -f '%e,%M' -o decode.time ./build/paq8px -d "kodim${IMAGE}.paq8px216" "kodim${IMAGE}.decoded.ppm" > decode.log 2>&1
+          python3 - <<'PY'
+          import csv, hashlib, json, os
+          from PIL import Image, ImageChops
+          n=os.environ['IMAGE']
+          src=f'kodim{n}.ppm'; dec=f'kodim{n}.decoded.ppm'; arc=f'kodim{n}.paq8px216'
+          if open(src,'rb').read()!=open(dec,'rb').read():
+              raise SystemExit('PPM byte mismatch')
+          with Image.open(src) as a, Image.open(dec) as b:
+              if ImageChops.difference(a.convert('RGB'),b.convert('RGB')).getbbox() is not None:
+                  raise SystemExit('RGB mismatch')
+              pixels=a.width*a.height
+          enc_s,enc_rss=open('encode.time').read().strip().split(',')
+          dec_s,dec_rss=open('decode.time').read().strip().split(',')
+          size=os.path.getsize(arc)
+          source=json.load(open('source.json'))
+          row={**source,'level':'-1','archive_bytes':size,'pixels':pixels,
+               'bpsp':size*8/(3*pixels),'encode_seconds':float(enc_s),
+               'decode_seconds':float(dec_s),'encode_maxrss_kb':int(enc_rss),
+               'decode_maxrss_kb':int(dec_rss),'exact':1,
+               'archive_sha256':hashlib.sha256(open(arc,'rb').read()).hexdigest()}
+          os.mkdir(f'result-{n}')
+          open(f'result-{n}/result.json','w').write(json.dumps(row,indent=2))
+          with open(f'result-{n}/result.csv','w',newline='') as f:
+              w=csv.DictWriter(f,fieldnames=row); w.writeheader(); w.writerow(row)
+          for name in (arc,'encode.log','decode.log'):
+              os.rename(name,f'result-{n}/'+name)
+          print(json.dumps(row,indent=2))
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: paq-kodim-${{ matrix.image }}
+          path: result-${{ matrix.image }}
+          if-no-files-found: error
+          retention-days: 3
+
+  aggregate:
+    needs: compress
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: paq-kodim-*
+          path: collected
+      - name: Aggregate physical bytes
+        run: |
+          python3 - <<'PY'
+          import csv, json, pathlib, tarfile
+          root=pathlib.Path('collected')
+          rows=[json.loads(p.read_text()) for p in sorted(root.glob('paq-kodim-*/result-*/result.json'))]
+          if len(rows)!=24 or any(r['exact']!=1 for r in rows):
+              raise SystemExit(f'incomplete exact set: {len(rows)}')
+          total=sum(r['archive_bytes'] for r in rows); pixels=sum(r['pixels'] for r in rows)
+          summary={'codec':'PAQ8PX v216','level':'-1','images':len(rows),'archive_bytes':total,
+                   'pixels':pixels,'rgb_samples':pixels*3,'bpsp':total*8/(pixels*3),
+                   'exact_images':sum(r['exact'] for r in rows),
+                   'mean_encode_seconds':sum(r['encode_seconds'] for r in rows)/len(rows),
+                   'mean_decode_seconds':sum(r['decode_seconds'] for r in rows)/len(rows)}
+          out=pathlib.Path('aggregate'); out.mkdir()
+          (out/'summary.json').write_text(json.dumps(summary,indent=2))
+          with (out/'results.csv').open('w',newline='') as f:
+              w=csv.DictWriter(f,fieldnames=rows[0]); w.writeheader(); w.writerows(rows)
+          with tarfile.open(out/'paq8px-v216-kodak-level1-results.tar.gz','w:gz') as t:
+              t.add(root,arcname='kodak-level1')
+          print(json.dumps(summary,indent=2))
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: paq8px-v216-kodak-level1-aggregate
+          path: aggregate
+          if-no-files-found: error
+          retention-days: 3
