@@ -15,7 +15,11 @@ jobs:
         run: ln -s Clz.hpp source/src/clz.hpp
       - run: cmake -S source -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
       - run: cmake --build build --parallel 2
+      - name: Package pinned source
+        run: tar -C source -czf paq8px-v216-source.tar.gz .
       - uses: actions/upload-artifact@v4
         with:
-          name: paq8px-v216-linux
-          path: build/paq8px
+          name: paq8px-v216-linux-and-source
+          path: |
+            build/paq8px
+            paq8px-v216-source.tar.gz
