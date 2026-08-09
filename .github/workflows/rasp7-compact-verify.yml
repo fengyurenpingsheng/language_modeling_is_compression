@@ -1,0 +1,149 @@
+name: RASP7 compact-header exact validation
+on:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: hxim/paq8px
+          ref: v216
+          path: source
+      - run: ln -s Clz.hpp source/src/clz.hpp
+      - run: cmake -S source -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DNATIVECPU=OFF
+      - run: cmake --build build --parallel 2
+      - uses: actions/upload-artifact@v4
+        with:
+          name: paq8px-v216-compact-validation
+          path: build/paq8px
+          retention-days: 3
+
+  validate:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      max-parallel: 24
+      matrix:
+        image: ['01','02','03','04','05','06','07','08','09','10','11','12','13','14','15','16','17','18','19','20','21','22','23','24']
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: paq8px-v216-compact-validation
+          path: bin
+      - uses: actions/download-artifact@v4
+        with:
+          name: rasp7-kodim-${{ matrix.image }}
+          path: prior
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          repository: fengyurenpingsheng/language_modeling_is_compression
+          run-id: 31323082034
+      - name: Rewrap, decode, and validate exact RGB
+        env:
+          IMAGE: ${{ matrix.image }}
+        run: |
+          set -euo pipefail
+          chmod +x bin/paq8px
+          python3 -m pip install --quiet pillow numpy
+          python3 - <<'PY'
+          import hashlib,json,os,pathlib
+          n=os.environ['IMAGE']
+          old_path=next(pathlib.Path('prior').rglob(f'kodim{n}.rsp7'))
+          result_path=next(pathlib.Path('prior').rglob('result.json'))
+          old=old_path.read_bytes(); result=json.loads(result_path.read_text())
+          assert old[:4]==b'RSP7' and len(old)>40
+          perm=old[7]; full_hash=old[8:40]; payload=old[40:]
+          flags=perm
+          compact=b'RSP7'+bytes([flags])+full_hash[:8]+payload
+          pathlib.Path(f'kodim{n}.rsp7').write_bytes(compact)
+          pathlib.Path('payload.paq8px216').write_bytes(payload)
+          meta={'image':f'kodim{n}.png','perm_id':perm,'full_rgb_sha256':full_hash.hex(),
+                'payload_sha256':hashlib.sha256(payload).hexdigest(),
+                'old_stream_sha256':hashlib.sha256(old).hexdigest(),
+                'compact_stream_sha256':hashlib.sha256(compact).hexdigest(),
+                'payload_bytes':len(payload),'header_bytes':13,'stream_bytes':len(compact),
+                'pixels':int(result['pixels'])}
+          pathlib.Path('predecode.json').write_text(json.dumps(meta,indent=2))
+          PY
+          /usr/bin/time -f '%e,%M' -o decode.time bin/paq8px -d payload.paq8px216 decoded-carrier.ppm > decode.log 2>&1
+          python3 - <<'PY'
+          import hashlib,json,os,pathlib
+          import numpy as np
+          from PIL import Image
+          n=os.environ['IMAGE']; meta=json.loads(pathlib.Path('predecode.json').read_text())
+          perms=[(0,1,2),(0,2,1),(1,0,2),(1,2,0),(2,0,1),(2,1,0)]
+          carrier=np.asarray(Image.open('decoded-carrier.ppm').convert('RGB'),dtype=np.uint8)
+          restored=np.empty_like(carrier)
+          for encoded_channel,original_channel in enumerate(perms[meta['perm_id']]):
+              restored[:,:,original_channel]=carrier[:,:,encoded_channel]
+          restored_sha=hashlib.sha256(restored.tobytes()).hexdigest()
+          if restored_sha!=meta['full_rgb_sha256']:
+              raise SystemExit('compact RSP7 RGB mismatch')
+          sec,rss=pathlib.Path('decode.time').read_text().strip().split(',')
+          row={**meta,'restored_rgb_sha256':restored_sha,'exact':1,
+               'bpsp':meta['stream_bytes']*8/(meta['pixels']*3),
+               'decode_seconds':float(sec),'decode_maxrss_kb':int(rss)}
+          out=pathlib.Path(f'result-{n}'); out.mkdir()
+          pathlib.Path(f'kodim{n}.rsp7').replace(out/f'kodim{n}.rsp7')
+          (out/'result.json').write_text(json.dumps(row,indent=2))
+          pathlib.Path('decode.log').replace(out/'decode.log')
+          print(json.dumps(row,indent=2))
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: compact-kodim-${{ matrix.image }}
+          path: result-${{ matrix.image }}
+          if-no-files-found: error
+          retention-days: 3
+
+  aggregate:
+    needs: validate
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: compact-kodim-*
+          path: collected
+      - name: Aggregate exact compact release
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import csv,json,pathlib,shutil
+          root=pathlib.Path('collected')
+          rows=[json.loads(p.read_text()) for p in root.rglob('result.json')]
+          rows.sort(key=lambda r:r['image'])
+          if len(rows)!=24 or any(r['exact']!=1 for r in rows):
+              raise SystemExit(f'incomplete exact compact set: {len(rows)}')
+          out=pathlib.Path('release'); streams=out/'streams'; streams.mkdir(parents=True)
+          for r in rows:
+              n=r['image'][5:7]
+              src=next(root.rglob(f'kodim{n}.rsp7'))
+              shutil.copy2(src,streams/src.name)
+          total=sum(r['stream_bytes'] for r in rows); payload=sum(r['payload_bytes'] for r in rows)
+          pixels=sum(r['pixels'] for r in rows); samples=pixels*3
+          summary={'codec':'RASP7-CCFS-MDL-Compact','images':24,'payload_bytes':payload,
+                   'header_bytes':13*24,'stream_bytes':total,'rgb_samples':samples,
+                   'bpsp':total*8/samples,'exact_images':sum(r['exact'] for r in rows),
+                   'target_bpsp':2.515,'max_passing_bytes':int((2.515*samples)//8),
+                   'passes_strict_gate':total*8/samples<2.515,
+                   'margin_bytes':int((2.515*samples)//8)-total,
+                   'mean_decode_seconds':sum(r['decode_seconds'] for r in rows)/24}
+          (out/'summary.json').write_text(json.dumps(summary,indent=2))
+          with (out/'results.csv').open('w',newline='') as f:
+              w=csv.DictWriter(f,fieldnames=rows[0]);w.writeheader();w.writerows(rows)
+          print(json.dumps(summary,indent=2))
+          PY
+          sha256sum release/streams/* release/summary.json release/results.csv > release/SHA256SUMS
+          tar -czf rasp7-compact-kodak24-release.tar.gz release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rasp7-compact-kodak24-release
+          path: |
+            release
+            rasp7-compact-kodak24-release.tar.gz
+          if-no-files-found: error
+          retention-days: 3
