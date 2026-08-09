@@ -1,0 +1,222 @@
+name: RASP7 high-capacity exact refinement
+on:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: hxim/paq8px
+          ref: v216
+          path: source
+      - run: ln -s Clz.hpp source/src/clz.hpp
+      - run: cmake -S source -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DNATIVECPU=OFF
+      - run: cmake --build build --parallel 2
+      - uses: actions/upload-artifact@v4
+        with:
+          name: paq8px-v216-highcap
+          path: build/paq8px
+          retention-days: 3
+
+  refine:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      max-parallel: 20
+      matrix:
+        image: ['01','02','03','04','05','06','07','08','09','10','11','12','13','14','15','16','17','18','19','20','21','22','23','24']
+        mode: [base, adaptive]
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: paq8px-v216-highcap
+          path: bin
+      - uses: actions/download-artifact@v4
+        with:
+          name: compact-kodim-${{ matrix.image }}
+          path: prior
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          repository: fengyurenpingsheng/language_modeling_is_compression
+          run-id: 31327206369
+      - name: Prepare exact carrier from prior manifest
+        env:
+          IMAGE: ${{ matrix.image }}
+          MODE: ${{ matrix.mode }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x bin/paq8px
+          python3 -m pip install --quiet pillow numpy
+          curl -L --fail --retry 5 --retry-delay 2 \
+            "https://r0k.us/graphics/kodak/kodak/kodim${IMAGE}.png" \
+            -o "kodim${IMAGE}.png"
+          python3 - <<'PY'
+          import hashlib,json,os,pathlib
+          import numpy as np
+          from PIL import Image
+          image=os.environ['IMAGE']
+          result=json.loads(next(pathlib.Path('prior').rglob('result.json')).read_text())
+          old=next(pathlib.Path('prior').rglob(f'kodim{image}.rsp7')).read_bytes()
+          if old[:4]!=b'RSP7' or len(old)<=13:
+              raise SystemExit('invalid prior compact stream')
+          pid=old[4]&7
+          perms=[(0,1,2),(0,2,1),(1,0,2),(1,2,0),(2,0,1),(2,1,0)]
+          rgb=np.asarray(Image.open(f'kodim{image}.png').convert('RGB'),dtype=np.uint8)
+          full=hashlib.sha256(rgb.tobytes()).hexdigest()
+          if full!=result['full_rgb_sha256']:
+              raise SystemExit(f'RGB hash mismatch {full} != {result["full_rgb_sha256"]}')
+          carrier=rgb[:,:,perms[pid]]
+          Image.fromarray(carrier,'RGB').save('carrier.ppm','PPM')
+          pathlib.Path('prior-header.bin').write_bytes(old[:13])
+          pathlib.Path('prior-stream.bin').write_bytes(old)
+          pathlib.Path('meta.json').write_text(json.dumps({
+              'image':f'kodim{image}.png','perm_id':pid,'full_rgb_sha256':full,
+              'old_stream_bytes':len(old),'pixels':rgb.shape[0]*rgb.shape[1]
+          },indent=2))
+          PY
+      - name: Compress high-capacity candidate and exact-decode
+        env:
+          IMAGE: ${{ matrix.image }}
+          MODE: ${{ matrix.mode }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "$MODE" = adaptive ]; then LEVEL=-8LA; else LEVEL=-8L; fi
+          /usr/bin/time -f '%e,%M' -o encode.time bin/paq8px "$LEVEL" carrier.ppm candidate.paq8px216 > encode.log 2>&1
+          /usr/bin/time -f '%e,%M' -o decode.time bin/paq8px -d candidate.paq8px216 decoded-carrier.ppm > decode.log 2>&1
+          cmp carrier.ppm decoded-carrier.ppm
+          python3 - <<'PY'
+          import hashlib,json,os,pathlib
+          import numpy as np
+          from PIL import Image
+          image=os.environ['IMAGE']; mode=os.environ['MODE']
+          level='-8LA' if mode=='adaptive' else '-8L'
+          meta=json.loads(pathlib.Path('meta.json').read_text())
+          pid=meta['perm_id']; perms=[(0,1,2),(0,2,1),(1,0,2),(1,2,0),(2,0,1),(2,1,0)]
+          carrier=np.asarray(Image.open('decoded-carrier.ppm').convert('RGB'),dtype=np.uint8)
+          restored=np.empty_like(carrier)
+          for encoded_channel,original_channel in enumerate(perms[pid]):
+              restored[:,:,original_channel]=carrier[:,:,encoded_channel]
+          full=hashlib.sha256(restored.tobytes()).hexdigest()
+          if full!=meta['full_rgb_sha256']:
+              raise SystemExit('restored RGB mismatch')
+          payload=pathlib.Path('candidate.paq8px216').read_bytes()
+          stream=pathlib.Path('prior-header.bin').read_bytes()+payload
+          out=pathlib.Path('out'); out.mkdir()
+          (out/f'kodim{image}-{mode}.rsp7').write_bytes(stream)
+          enc_sec,enc_rss=pathlib.Path('encode.time').read_text().strip().split(',')
+          dec_sec,dec_rss=pathlib.Path('decode.time').read_text().strip().split(',')
+          result={**meta,'mode':mode,'level':level,'payload_bytes':len(payload),
+                  'stream_bytes':len(stream),'bpsp':len(stream)*8/(meta['pixels']*3),
+                  'old_stream_bytes':meta['old_stream_bytes'],
+                  'delta_bytes_vs_l1':len(stream)-meta['old_stream_bytes'],
+                  'exact':1,'restored_rgb_sha256':full,
+                  'payload_sha256':hashlib.sha256(payload).hexdigest(),
+                  'stream_sha256':hashlib.sha256(stream).hexdigest(),
+                  'encode_seconds':float(enc_sec),'encode_maxrss_kb':int(enc_rss),
+                  'decode_seconds':float(dec_sec),'decode_maxrss_kb':int(dec_rss)}
+          (out/'result.json').write_text(json.dumps(result,indent=2)+'\n')
+          print(json.dumps(result,indent=2))
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: highcap-${{ matrix.image }}-${{ matrix.mode }}
+          path: out
+          if-no-files-found: error
+          retention-days: 3
+
+  aggregate:
+    needs: refine
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: highcap-*
+          path: candidates
+      - uses: actions/download-artifact@v4
+        with:
+          name: rasp7-compact-kodak24-release
+          path: prior-release
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          repository: fengyurenpingsheng/language_modeling_is_compression
+          run-id: 31327206369
+      - name: Build exact three-way physical-byte portfolio
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import collections,csv,hashlib,json,pathlib,shutil
+          candidates=pathlib.Path('candidates')
+          prior=pathlib.Path('prior-release')
+          old_rows={r['image']:r for r in csv.DictReader(next(prior.rglob('results.csv')).open())}
+          new_rows=[json.loads(p.read_text()) for p in candidates.rglob('result.json')]
+          if len(new_rows)!=48 or any(r['exact']!=1 for r in new_rows):
+              raise SystemExit(f'incomplete high-capacity results: {len(new_rows)}')
+          out=pathlib.Path('release'); streams=out/'streams'; streams.mkdir(parents=True)
+          selected=[]
+          for i in range(1,25):
+              image=f'kodim{i:02d}.png'; stem=f'kodim{i:02d}'
+              old_stream=next(prior.rglob(f'{stem}.rsp7'))
+              old=old_rows[image]
+              options=[{'source':'l1-six-permutation','mode':'l1','level':'-1',
+                        'stream_bytes':int(old['stream_bytes']),'exact':int(old['exact']),
+                        'stream_path':old_stream,'full_rgb_sha256':old['full_rgb_sha256'],
+                        'payload_bytes':int(old['payload_bytes']),
+                        'stream_sha256':old['compact_stream_sha256']}]
+              for r in new_rows:
+                  if r['image']==image:
+                      q=dict(r); q['source']='high-capacity-selected-factorization'
+                      q['stream_path']=next(candidates.rglob(f'{stem}-{r["mode"]}.rsp7'))
+                      options.append(q)
+              if len(options)!=3 or any(int(q['exact'])!=1 for q in options):
+                  raise SystemExit(f'bad options for {image}')
+              best=min(options,key=lambda q:(int(q['stream_bytes']),q['mode']))
+              dst=streams/f'{stem}.rsp7'; shutil.copy2(best['stream_path'],dst)
+              if hashlib.sha256(dst.read_bytes()).hexdigest()!=best['stream_sha256']:
+                  raise SystemExit(f'stream hash mismatch {image}')
+              selected.append({
+                  'image':image,'selected_mode':best['mode'],'selected_level':best['level'],
+                  'selected_source':best['source'],'perm_id':int(old['perm_id']),
+                  'full_rgb_sha256':best['full_rgb_sha256'],
+                  'payload_bytes':int(best['payload_bytes']),
+                  'stream_bytes':int(best['stream_bytes']),
+                  'stream_sha256':best['stream_sha256'],
+                  'l1_stream_bytes':int(old['stream_bytes']),
+                  'savings_vs_l1':int(old['stream_bytes'])-int(best['stream_bytes']),
+                  'exact':1,
+              })
+          total=sum(r['stream_bytes'] for r in selected); payload=sum(r['payload_bytes'] for r in selected)
+          samples=24*393216*3; max_bytes=int((2.515*samples)//8)
+          summary={'codec':'RASP7-CCFS-MDL-HighCap-Portfolio','images':24,
+                   'payload_bytes':payload,'header_bytes':13*24,'stream_bytes':total,
+                   'rgb_samples':samples,'bpsp':total*8/samples,'exact_images':24,
+                   'l1_compact_bytes':6600521,'savings_vs_l1_bytes':6600521-total,
+                   'selection_histogram':dict(collections.Counter(r['selected_mode'] for r in selected)),
+                   'target_bpsp':2.515,'max_passing_bytes':max_bytes,
+                   'passes_strict_gate':total<max_bytes,'margin_bytes':max_bytes-total}
+          (out/'summary.json').write_text(json.dumps(summary,indent=2)+'\n')
+          with (out/'selection.csv').open('w',newline='') as f:
+              w=csv.DictWriter(f,fieldnames=selected[0]);w.writeheader();w.writerows(selected)
+          with (out/'highcap_candidates.csv').open('w',newline='') as f:
+              fields=[]
+              for r in new_rows:
+                  for k in r:
+                      if k not in fields: fields.append(k)
+              w=csv.DictWriter(f,fieldnames=fields);w.writeheader();w.writerows(new_rows)
+          print(json.dumps(summary,indent=2))
+          PY
+          sha256sum release/streams/* release/summary.json release/selection.csv release/highcap_candidates.csv > release/SHA256SUMS
+          tar -czf rasp7-highcap-kodak24-release.tar.gz release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rasp7-highcap-kodak24-release
+          path: |
+            release
+            rasp7-highcap-kodak24-release.tar.gz
+          if-no-files-found: error
+          retention-days: 3
