@@ -11,6 +11,8 @@ jobs:
           repository: hxim/paq8px
           ref: v216
           path: source
+      - name: Linux compatibility patch
+        run: ln -s Clz.hpp source/src/clz.hpp
       - run: cmake -S source -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
       - run: cmake --build build --parallel 2
       - uses: actions/upload-artifact@v4
