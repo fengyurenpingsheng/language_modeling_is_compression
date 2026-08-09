@@ -1,8 +1,7 @@
 name: RASP7 channel-factorization MDL Kodak exact benchmark
 
 on:
-  push:
-    branches: [rasp7-channel-mdl-kodak-20260809]
+  pull_request:
   workflow_dispatch:
 
 jobs:
@@ -21,16 +20,13 @@ jobs:
           repository: hxim/paq8px
           ref: v216
           path: source
-
       - name: Linux compatibility patch
         run: ln -s Clz.hpp source/src/clz.hpp
-
       - name: Build pinned codec
         run: |
           cmake -S source -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DNATIVECPU=OFF -DNDEBUG=ON
           cmake --build build --parallel 2
           sha256sum build/paq8px | tee paq8px.sha256
-
       - name: Prepare the six causal channel factorizations
         env:
           IMAGE: ${{ matrix.image }}
@@ -45,34 +41,24 @@ jobs:
           perms=[(0,1,2),(0,2,1),(1,0,2),(1,2,0),(2,0,1),(2,1,0)]
           with Image.open(f'kodim{n}.png') as src:
               rgb=np.asarray(src.convert('RGB'),dtype=np.uint8)
-          meta={
-              'image':f'kodim{n}.png',
-              'width':int(rgb.shape[1]),
-              'height':int(rgb.shape[0]),
-              'pixels':int(rgb.shape[0]*rgb.shape[1]),
-              'rgb_sha256':hashlib.sha256(rgb.tobytes()).hexdigest(),
-              'permutations':[list(p) for p in perms],
-          }
+          meta={'image':f'kodim{n}.png','width':int(rgb.shape[1]),'height':int(rgb.shape[0]),'pixels':int(rgb.shape[0]*rgb.shape[1]),'rgb_sha256':hashlib.sha256(rgb.tobytes()).hexdigest(),'permutations':[list(p) for p in perms]}
           for i,p in enumerate(perms):
               Image.fromarray(rgb[:,:,p],mode='RGB').save(f'p{i}.ppm','PPM')
           open('source.json','w').write(json.dumps(meta,indent=2))
           PY
-
       - name: Exact physical-byte MDL search
         run: |
           for p in 0 1 2 3 4 5; do
             /usr/bin/time -f '%e,%M' -o "p${p}.time" ./build/paq8px -1 "p${p}.ppm" "p${p}.paq8px216" > "p${p}.encode.log" 2>&1
           done
-
       - name: Build and validate proof-carrying RSP7 stream
         env:
           IMAGE: ${{ matrix.image }}
         run: |
           python3 - <<'PY'
-          import csv, hashlib, json, os, pathlib, shutil, struct, subprocess, time
+          import csv, hashlib, json, os, pathlib, shutil, subprocess, time
           import numpy as np
           from PIL import Image
-
           n=os.environ['IMAGE']
           meta=json.load(open('source.json'))
           perms=[tuple(p) for p in meta['permutations']]
@@ -80,24 +66,12 @@ jobs:
           for i,p in enumerate(perms):
               sec,rss=open(f'p{i}.time').read().strip().split(',')
               arc=pathlib.Path(f'p{i}.paq8px216')
-              candidates.append({
-                  'perm_id':i,
-                  'permutation':''.join('RGB'[j] for j in p),
-                  'archive_bytes':arc.stat().st_size,
-                  'encode_seconds':float(sec),
-                  'encode_maxrss_kb':int(rss),
-                  'archive_sha256':hashlib.sha256(arc.read_bytes()).hexdigest(),
-              })
+              candidates.append({'perm_id':i,'permutation':''.join('RGB'[j] for j in p),'archive_bytes':arc.stat().st_size,'encode_seconds':float(sec),'encode_maxrss_kb':int(rss),'archive_sha256':hashlib.sha256(arc.read_bytes()).hexdigest()})
           best=min(candidates,key=lambda r:(r['archive_bytes'],r['perm_id']))
-          pid=best['perm_id']; perm=perms[pid]
-          payload=pathlib.Path(f'p{pid}.paq8px216').read_bytes()
-          # RSP7 v1 fixed header: magic, version, backend, D4 id, permutation id, raw RGB SHA-256.
+          pid=best['perm_id']; payload=pathlib.Path(f'p{pid}.paq8px216').read_bytes()
           header=b'RSP7'+bytes([1,1,0,pid])+bytes.fromhex(meta['rgb_sha256'])
           assert len(header)==40
-          out=pathlib.Path(f'kodim{n}.rsp7')
-          out.write_bytes(header+payload)
-
-          # Parse the final stream rather than reusing the candidate file.
+          out=pathlib.Path(f'kodim{n}.rsp7'); out.write_bytes(header+payload)
           stream=out.read_bytes()
           assert stream[:4]==b'RSP7' and stream[4]==1 and stream[5]==1 and stream[6]==0
           parsed_pid=stream[7]
@@ -107,53 +81,24 @@ jobs:
           proc=subprocess.run(['./build/paq8px','-d','selected.paq8px216','decoded-carrier.ppm'],stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,check=True)
           decode_seconds=time.monotonic()-t0
           pathlib.Path('decode.log').write_text(proc.stdout)
-
           carrier=np.asarray(Image.open('decoded-carrier.ppm').convert('RGB'),dtype=np.uint8)
           original=np.asarray(Image.open(f'kodim{n}.png').convert('RGB'),dtype=np.uint8)
           restored=np.empty_like(carrier)
           for encoded_channel, original_channel in enumerate(perms[parsed_pid]):
               restored[:,:,original_channel]=carrier[:,:,encoded_channel]
-          exact=bool(np.array_equal(restored,original))
-          restored_sha=hashlib.sha256(restored.tobytes()).hexdigest()
+          exact=bool(np.array_equal(restored,original)); restored_sha=hashlib.sha256(restored.tobytes()).hexdigest()
           if not exact or restored_sha!=meta['rgb_sha256']:
               raise SystemExit('RSP7 RGB round-trip mismatch')
-
-          result_dir=pathlib.Path(f'result-{n}'); result_dir.mkdir()
-          shutil.copy2(out,result_dir/out.name)
-          row={
-              **meta,
-              'codec':'RASP7-CCFS-MDL',
-              'backend':'PAQ8PX-v216',
-              'backend_source_commit':'bf7b658fdcfc045a892920d01e830e6c6a790c21',
-              'level':'-1',
-              'candidate_count':6,
-              'selected_perm_id':pid,
-              'selected_permutation':best['permutation'],
-              'identity_payload_bytes':candidates[0]['archive_bytes'],
-              'selected_payload_bytes':len(payload),
-              'payload_savings_bytes':candidates[0]['archive_bytes']-len(payload),
-              'header_bytes':len(header),
-              'stream_bytes':out.stat().st_size,
-              'bpsp':out.stat().st_size*8/(meta['pixels']*3),
-              'selected_encode_seconds':best['encode_seconds'],
-              'search_encode_seconds':sum(c['encode_seconds'] for c in candidates),
-              'decode_seconds':decode_seconds,
-              'exact':1,
-              'stream_sha256':hashlib.sha256(out.read_bytes()).hexdigest(),
-              'restored_rgb_sha256':restored_sha,
-          }
+          result_dir=pathlib.Path(f'result-{n}'); result_dir.mkdir(); shutil.copy2(out,result_dir/out.name)
+          row={**meta,'codec':'RASP7-CCFS-MDL','backend':'PAQ8PX-v216','backend_source_commit':'bf7b658fdcfc045a892920d01e830e6c6a790c21','level':'-1','candidate_count':6,'selected_perm_id':pid,'selected_permutation':best['permutation'],'identity_payload_bytes':candidates[0]['archive_bytes'],'selected_payload_bytes':len(payload),'payload_savings_bytes':candidates[0]['archive_bytes']-len(payload),'header_bytes':len(header),'stream_bytes':out.stat().st_size,'bpsp':out.stat().st_size*8/(meta['pixels']*3),'selected_encode_seconds':best['encode_seconds'],'search_encode_seconds':sum(c['encode_seconds'] for c in candidates),'decode_seconds':decode_seconds,'exact':1,'stream_sha256':hashlib.sha256(out.read_bytes()).hexdigest(),'restored_rgb_sha256':restored_sha}
           (result_dir/'result.json').write_text(json.dumps(row,indent=2))
           with (result_dir/'result.csv').open('w',newline='') as f:
               w=csv.DictWriter(f,fieldnames=row.keys()); w.writeheader(); w.writerow(row)
           with (result_dir/'candidates.csv').open('w',newline='') as f:
               w=csv.DictWriter(f,fieldnames=candidates[0].keys()); w.writeheader(); w.writerows(candidates)
-          shutil.copy2('source.json',result_dir/'source.json')
-          shutil.copy2('paq8px.sha256',result_dir/'paq8px.sha256')
-          shutil.copy2(f'p{pid}.encode.log',result_dir/'selected.encode.log')
-          shutil.copy2('decode.log',result_dir/'decode.log')
+          shutil.copy2('source.json',result_dir/'source.json'); shutil.copy2('paq8px.sha256',result_dir/'paq8px.sha256'); shutil.copy2(f'p{pid}.encode.log',result_dir/'selected.encode.log'); shutil.copy2('decode.log',result_dir/'decode.log')
           print(json.dumps(row,indent=2))
           PY
-
       - name: Upload exact stream and audit record
         uses: actions/upload-artifact@v4
         with:
@@ -171,64 +116,24 @@ jobs:
         with:
           pattern: rasp7-kodim-*
           path: collected
-
       - name: Aggregate physical streams and enforce SOTA gate
         run: |
           python3 - <<'PY'
           import csv, json, math, pathlib, tarfile
-          root=pathlib.Path('collected')
-          result_paths=sorted(root.glob('**/result.json'))
-          rows=[json.loads(p.read_text()) for p in result_paths]
-          if len(rows)!=24 or any(r['exact']!=1 for r in rows):
-              raise SystemExit(f'incomplete exact set: {len(rows)}')
-          total=sum(r['stream_bytes'] for r in rows)
-          payload=sum(r['selected_payload_bytes'] for r in rows)
-          identity=sum(r['identity_payload_bytes'] for r in rows)
-          pixels=sum(r['pixels'] for r in rows)
-          samples=pixels*3
-          target=2.515
-          max_passing_bytes=math.ceil(target*samples/8)-1
-          bpsp=total*8/samples
-          summary={
-              'codec':'RASP7-CCFS-MDL',
-              'backend':'PAQ8PX-v216 -1',
-              'images':len(rows),
-              'pixels':pixels,
-              'rgb_samples':samples,
-              'payload_bytes':payload,
-              'header_bytes':sum(r['header_bytes'] for r in rows),
-              'stream_bytes':total,
-              'bpsp':bpsp,
-              'exact_images':sum(r['exact'] for r in rows),
-              'identity_payload_bytes':identity,
-              'channel_mdl_savings_bytes':identity-payload,
-              'channel_mdl_relative_savings':(identity-payload)/identity,
-              'learned_sota_gate_bpsp':target,
-              'max_passing_bytes':max_passing_bytes,
-              'margin_bytes':max_passing_bytes-total,
-              'relative_bpsp_improvement_vs_2_515':(target-bpsp)/target,
-              'passes_strict_gate':bool(total<=max_passing_bytes and len(rows)==24 and all(r['exact']==1 for r in rows)),
-              'selected_permutation_histogram':{str(k):sum(r['selected_perm_id']==k for r in rows) for k in range(6)},
-              'mean_search_encode_seconds':sum(r['search_encode_seconds'] for r in rows)/len(rows),
-              'mean_decode_seconds':sum(r['decode_seconds'] for r in rows)/len(rows),
-          }
-          if not summary['passes_strict_gate']:
-              raise SystemExit(json.dumps(summary,indent=2))
-          out=pathlib.Path('aggregate'); (out/'streams').mkdir(parents=True)
-          (out/'summary.json').write_text(json.dumps(summary,indent=2))
+          root=pathlib.Path('collected'); rows=[json.loads(p.read_text()) for p in sorted(root.glob('**/result.json'))]
+          if len(rows)!=24 or any(r['exact']!=1 for r in rows): raise SystemExit(f'incomplete exact set: {len(rows)}')
+          total=sum(r['stream_bytes'] for r in rows); payload=sum(r['selected_payload_bytes'] for r in rows); identity=sum(r['identity_payload_bytes'] for r in rows); pixels=sum(r['pixels'] for r in rows); samples=pixels*3; target=2.515; max_passing_bytes=math.ceil(target*samples/8)-1; bpsp=total*8/samples
+          summary={'codec':'RASP7-CCFS-MDL','backend':'PAQ8PX-v216 -1','images':len(rows),'pixels':pixels,'rgb_samples':samples,'payload_bytes':payload,'header_bytes':sum(r['header_bytes'] for r in rows),'stream_bytes':total,'bpsp':bpsp,'exact_images':sum(r['exact'] for r in rows),'identity_payload_bytes':identity,'channel_mdl_savings_bytes':identity-payload,'channel_mdl_relative_savings':(identity-payload)/identity,'learned_sota_gate_bpsp':target,'max_passing_bytes':max_passing_bytes,'margin_bytes':max_passing_bytes-total,'relative_bpsp_improvement_vs_2_515':(target-bpsp)/target,'passes_strict_gate':bool(total<=max_passing_bytes and len(rows)==24 and all(r['exact']==1 for r in rows)),'selected_permutation_histogram':{str(k):sum(r['selected_perm_id']==k for r in rows) for k in range(6)},'mean_search_encode_seconds':sum(r['search_encode_seconds'] for r in rows)/len(rows),'mean_decode_seconds':sum(r['decode_seconds'] for r in rows)/len(rows)}
+          if not summary['passes_strict_gate']: raise SystemExit(json.dumps(summary,indent=2))
+          out=pathlib.Path('aggregate'); (out/'streams').mkdir(parents=True); (out/'summary.json').write_text(json.dumps(summary,indent=2))
           with (out/'results.csv').open('w',newline='') as f:
               w=csv.DictWriter(f,fieldnames=rows[0].keys()); w.writeheader(); w.writerows(rows)
-          for p in root.glob('**/*.rsp7'):
-              (out/'streams'/p.name).write_bytes(p.read_bytes())
-          if len(list((out/'streams').glob('*.rsp7')))!=24:
-              raise SystemExit('missing final streams')
+          for p in root.glob('**/*.rsp7'): (out/'streams'/p.name).write_bytes(p.read_bytes())
+          if len(list((out/'streams').glob('*.rsp7')))!=24: raise SystemExit('missing final streams')
           with tarfile.open(out/'rasp7-kodak24-release.tar.gz','w:gz') as t:
-              t.add(out/'streams',arcname='streams')
-              t.add(out/'summary.json',arcname='summary.json')
-              t.add(out/'results.csv',arcname='results.csv')
+              t.add(out/'streams',arcname='streams'); t.add(out/'summary.json',arcname='summary.json'); t.add(out/'results.csv',arcname='results.csv')
           print(json.dumps(summary,indent=2))
           PY
-
       - name: Upload aggregate release
         uses: actions/upload-artifact@v4
         with:
