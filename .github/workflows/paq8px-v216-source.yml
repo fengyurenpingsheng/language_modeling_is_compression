@@ -1,0 +1,27 @@
+name: PAQ8PX v216 source snapshot
+on:
+  pull_request:
+  workflow_dispatch:
+jobs:
+  snapshot:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: hxim/paq8px
+          ref: v216
+          path: source
+      - name: Record source identity and package
+        run: |
+          set -euo pipefail
+          git -C source rev-parse HEAD > PAQ8PX_COMMIT
+          tar --exclude=.git -czf paq8px-v216-source.tar.gz source PAQ8PX_COMMIT
+          sha256sum paq8px-v216-source.tar.gz > SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: paq8px-v216-source
+          path: |
+            paq8px-v216-source.tar.gz
+            PAQ8PX_COMMIT
+            SHA256SUMS
+          retention-days: 7
